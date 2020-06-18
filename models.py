@@ -39,9 +39,8 @@ class EqualLinear(nn.Module):
 
             # fused version of leaky relu
             out = out + (self.bias * self.lr_mul)
-            out = F.leaky_relu(out)
+            out = F.leaky_relu(out) * (2 ** 0.5)
 
-            
         else:
             out = F.linear(input, self.weight * self.scale, bias=self.bias * self.lr_mul)
         
@@ -130,7 +129,7 @@ class ModulatedConv2d(nn.Module):
             pad1 = p // 2 + 1
             
             # create blur Layer
-            self.blur = Blur(blur_kernel, (pad0, pad1))
+            self.blur = Blur(blur_kernel, (pad0, pad1), upsample_factor=factor)
         
         if down_sample:
             # define padding parameters
@@ -222,7 +221,7 @@ class ModulatedConv2d(nn.Module):
         return out
     
     def __repr__(self):
-        return (f'{self.__class__.__name__}({self.in_channel}, {self.out_channel}, {self.kernel_size}, 'f'upsample={self.upsample}, downsample={self.downsample})')
+        return (f'{self.__class__.__name__}({self.in_channel}, {self.out_channel}, {self.kernel_size}, 'f'upsample={self.up_sample}, downsample={self.down_sample})')
     
 
 # Inject noise on image (for detail jittering like hair ...)
@@ -378,7 +377,6 @@ class Generator(nn.Module):
         self.num_layers = (self.log_size - 2) * 2 + 1
 
         self.convs = nn.ModuleList()
-        self.upsamples = nn.ModuleList()
         self.to_rgbs = nn.ModuleList()
         self.noises = nn.Module()
 
@@ -459,7 +457,7 @@ class Generator(nn.Module):
             else:
                 latent = styles[0]
         
-        # Choose where to inject the second style
+        # Else Choose where to inject the second style
         else:
             if inject_index is None:
                 inject_index = np.random.randint(1, self.n_latent - 1)
@@ -498,129 +496,163 @@ class Generator(nn.Module):
         else:
             return image, None
 
+#Fused version of LeakyReLU
+class FusedLeakyReLU(nn.Module):
+    def __init__(self, channel, negative_slope=0.2, scale=2 ** 0.5):
+        super().__init__()
+
+        self.bias = nn.Parameter(torch.zeros(channel))
+        self.negative_slope = negative_slope
+        self.scale = scale
+
+    def forward(self, input):
+        return F.leaky_relu(input + self.bias, negative_slope=self.negative_slope) * self.scale
+
+# Custom conv2D class
+class EqualConv2d(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True, activate=True):
+        super().__init__()
+
+        self.weight = nn.Parameter(
+            torch.randn(out_channel, in_channel, kernel_size, kernel_size)
+        )
+        
+        self.scale = 1 / math.sqrt(in_channel * kernel_size ** 2)
+
+        self.stride = stride
+        self.padding = padding
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channel))
+
+        else:
+            self.bias = None
+
+    def forward(self, input):
+        out = F.conv2d(input, self.weight * self.scale, bias=self.bias, stride=self.stride, padding=self.padding)
+        return out
+
+    def __repr__(self):
+        return (
+            f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]},'
+            f' {self.weight.shape[2]}, stride={self.stride}, padding={self.padding})'
+        )
 
 
+# Conv Block for Discriminator
+class ConvLayer(nn.Sequential):
+    def __init__(self, in_channel, out_channel, kernel_size, downsample=False, blur_kernel=[1, 3, 3, 1], bias=True, activate=True):
+        layers = []
 
-import math
-import random
-import os
+        if downsample:
+            factor = 2
+            p = (len(blur_kernel) - factor) + (kernel_size - 1)
+            pad0 = (p + 1) // 2
+            pad1 = p // 2
 
-import numpy as np
-import torch
-from torch import nn, autograd, optim
-from torch.nn import functional as F
-from torch.utils import data
-import torch.distributed as dist
-from torchvision import transforms, utils
-from tqdm import tqdm
+            layers.append(Blur(blur_kernel, pad=(pad0, pad1)))
 
-from dataset import CreateDataset
-import matplotlib.pyplot as plt
+            stride = 2
+            self.padding = 0
 
-BATCH = 4
+        else:
+            stride = 1
+            self.padding = kernel_size // 2
+        
+        layers.append(EqualConv2d(in_channel, out_channel, kernel_size, padding=self.padding, stride=stride, bias=bias and not activate))
+        
+        if activate:
+            if bias:
+                layers.append(FusedLeakyReLU((1, out_channel, 1, 1)))
 
-def data_sampler(dataset, shuffle, distributed):
-    if distributed:
-        return data.distributed.DistributedSampler(dataset, shuffle=shuffle)
+            else:
+                layers.append(ScaledLeakyReLU(0.2))
 
-    if shuffle:
-        return data.RandomSampler(dataset)
+        super().__init__(*layers)
 
-    else:
-        return data.SequentialSampler(dataset)
+# Double convLayer with one downsample plus kernel sized one convLayer
+class ResBlock(nn.Module):
+    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
+        super().__init__()
 
-SIZE = 256
+        self.conv1 = ConvLayer(in_channel, in_channel, 3)
+        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
 
-generator = Generator(SIZE, 512, 8, channel_multiplier=2).cuda()
+        self.skip = ConvLayer(
+            in_channel, out_channel, 1, downsample=True, activate=False, bias=False
+        )
 
-transform = transforms.Compose(
-        [
-            transforms.RandomHorizontalFlip(),
-            transforms.Resize(SIZE, Image.LANCZOS),
-            transforms.CenterCrop((SIZE, SIZE)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-        ]
-    )
+    def forward(self, input):
+        out = self.conv1(input)
+        out = self.conv2(out)
 
-dataset = CreateDataset("C:/Users/quent/Desktop/art generation/all/1/", transform)
-loader = data.DataLoader(
-    dataset,
-    batch_size=BATCH,
-    sampler=data_sampler(dataset, shuffle=True, distributed=False),
-    drop_last=True,
-)
+        skip = self.skip(input)
+        out = (out + skip) / math.sqrt(2)
 
-for b in loader:
-    a = b
-    break;
+        return out
 
-print(a.shape)
+class Discriminator(nn.Module):
+    def __init__(self, size, channel_multiplier=2, blur_kernel=[1, 3, 3, 1]):
+        super().__init__()
 
-def showTensorImage(image):
-    fig = plt.figure()
-    image = image.cpu().detach().numpy()
-    image = np.swapaxes(np.swapaxes(image, 0, 2), 0, 1)
-    plt.imshow(image)
-    plt.show()
+        channels = {
+            4: 512,
+            8: 512,
+            16: 512,
+            32: 512,
+            64: 256 * channel_multiplier,
+            128: 128 * channel_multiplier,
+            256: 64 * channel_multiplier,
+            512: 32 * channel_multiplier,
+            1024: 16 * channel_multiplier,
+        }
 
-def sample_data(loader):
-    while True:
-        for batch in loader:
-            yield batch
-            
-def requires_grad(model, flag=True):
-    for p in model.parameters():
-        p.requires_grad = flag
+        convs = [ConvLayer(3, channels[size], 1)]
 
-def make_noise(batch, latent_dim, n_noise):
-    if n_noise == 1:
-        return torch.randn(batch, latent_dim).cuda()
+        log_size = int(math.log(size, 2))
 
-    noises = torch.randn(n_noise, batch, latent_dim).cuda().unbind(0)
+        in_channel = channels[size]
 
-    return noises
+        for i in range(log_size, 2, -1):
+            out_channel = channels[2 ** (i - 1)]
 
+            convs.append(ResBlock(in_channel, out_channel, blur_kernel))
 
-def mixing_noise(batch, latent_dim, prob):
-    if prob > 0 and random.random() < prob:
-        return make_noise(batch, latent_dim, 2)
+            in_channel = out_channel
 
-    else:
-        return [make_noise(batch, latent_dim, 1)]
+        self.convs = nn.Sequential(*convs)
 
-loader = sample_data(loader)
+        self.stddev_group = 4
+        self.stddev_feat = 1
 
-g_module = generator
+        # in_channel +1  for the stddev 
+        self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)
+        # ^
+        # '-- out shape : batch, 512, 4, 4
+        
+        # conv to Linear
+        self.final_linear = nn.Sequential(
+            EqualLinear(channels[4] * 4 * 4, channels[4], activation=True),
+            EqualLinear(channels[4], 1),
+        )
 
-pbar = range(2)
+    def forward(self, input):
+        out = self.convs(input)
 
-for idx in pbar:
-    i = idx
-    print(i)
-    
-    real_img = next(loader)
-    real_img = real_img.cuda()
-    
-    requires_grad(generator, False)
+        # adding the standart deviation of images for discrimination (majoritarely for the droplet glitch)
+        batch, channel, height, width = out.shape
+        group = min(batch, self.stddev_group)
+        stddev = out.view(
+            group, -1, self.stddev_feat, channel // self.stddev_feat, height, width
+        )
+        stddev = torch.sqrt(stddev.var(0, unbiased=False) + 1e-8)
+        stddev = stddev.mean([2, 3, 4], keepdims=True).squeeze(2)
+        stddev = stddev.repeat(group, 1, height, width)
+        out = torch.cat([out, stddev], 1)
 
-    noise = mixing_noise(BATCH, 512, 0.9)
-    fake_img, _ = generator(noise)
-    showTensorImage(fake_img[0])
+        out = self.final_conv(out)
 
+        out = out.view(batch, -1)
+        out = self.final_linear(out)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+        return out
