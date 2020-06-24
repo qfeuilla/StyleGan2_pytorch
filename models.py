@@ -11,6 +11,21 @@ from PIL import Image
 from torchvision import transforms
 import numpy as np
 
+# Fused version of leaky ReLU
+class FusedLeakyReLU(nn.Module):
+    def __init__(self, channel, negative_slope=0.2, scale=2 ** 0.5):
+        super().__init__()
+
+        self.bias = nn.Parameter(torch.zeros(channel))
+        self.negative_slope = negative_slope
+        self.scale = scale
+
+    def forward(self, input):
+        return fused_leaky_relu(input, self.bias, self.negative_slope, self.scale)
+
+def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
+    return scale * F.leaky_relu(input + bias.view((1, -1)+(1,)*(len(input.shape)-2)), negative_slope=negative_slope)
+
 #Linear Layer
 class EqualLinear(nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=False):
@@ -31,15 +46,12 @@ class EqualLinear(nn.Module):
         # used to scale the weight
         self.scale = (1 / math.sqrt(in_dim)) * lr_mul
         self.lr_mul = lr_mul
-            
+
     def forward(self, input):
         # if activation bias is used on leaky relu else, directly in the linear function
         if self.activation:
             out = F.linear(input, self.weight * self.scale)
-
-            # fused version of leaky relu
-            out = out + (self.bias * self.lr_mul)
-            out = F.leaky_relu(out) * (2 ** 0.5)
+            out = fused_leaky_relu(out, self.bias * self.lr_mul)
 
         else:
             out = F.linear(input, self.weight * self.scale, bias=self.bias * self.lr_mul)
@@ -58,12 +70,12 @@ class PixelNorm(nn.Module):
     def forward(self, input):
         return input * torch.rsqrt(torch.mean(input ** 2, dim=1, keepdim=True) + 1e-8)
 
-# Input layer 
+# Input layer
 class ConstantInput(nn.Module):
-    def __init__(self, channel, size=4):
+    def __init__(self, channel, sizex=4, sizey=4):
         super().__init__()
 
-        self.input = nn.Parameter(torch.randn(1, channel, size, size))
+        self.input = nn.Parameter(torch.randn(1, channel, sizex, sizey))
 
     def forward(self, input):
         # batch for multiple image
@@ -164,7 +176,7 @@ class ModulatedConv2d(nn.Module):
         style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
         
         # Adding style modulation to weight
-        weight = self.weight * style * self.scale
+        weight = self.scale * self.weight * style
         
         if self.demodulate:
             demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
@@ -257,13 +269,11 @@ class StyledConv(nn.Module):
         
         self.conv = ModulatedConv2d(in_channel, out_channel, kernel_size, style_dim, up_sample=upsample, blur_kernel=blur_kernel, demodulate=demodulate)
         self.noise = NoiseInjection()
-        self.bias = nn.Parameter(torch.zeros(1, out_channel, 1, 1))
-        self.activate = ScaledLeakyReLU(0.2)
+        self.activate = FusedLeakyReLU(out_channel)
 
     def forward(self, input, style, noise=None):
         out = self.conv(input, style)
         out = self.noise(out, noise=noise)
-        out = out + self.bias
         out = self.activate(out)
 
         return out
@@ -336,10 +346,10 @@ class ToRGB(nn.Module):
         return out
 
 class Generator(nn.Module):
-    def __init__(self, size, style_dim, n_mlp, channel_multiplier=2, blur_kernel=[1, 3, 3, 1], lr_mlp=0.01):
+    def __init__(self, sizeX, sizeY, style_dim, n_mlp, channel_multiplier=2, blur_kernel=[1, 3, 3, 1], lr_mlp=0.01):
         super().__init__()
 
-        self.size = size
+        self.size = max(sizeX, sizeY)
 
         self.style_dim = style_dim
         
@@ -367,14 +377,17 @@ class Generator(nn.Module):
             512: 32 * channel_multiplier,
             1024: 16 * channel_multiplier,
         }
-
-        self.input = ConstantInput(self.channels[4])
+        
+        self.log_size = int(math.log(self.size, 2))
+        self.num_layers = (self.log_size - 2) * 2 + 1
+        
+        sizex = sizeX // ((self.num_layers - 1) ** 2)
+        sizey = sizeY // ((self.num_layers - 1) ** 2)
+        
+        self.input = ConstantInput(self.channels[4], sizex, sizey)
 
         self.conv1 = StyledConv(self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel)
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
-
-        self.log_size = int(math.log(size, 2))
-        self.num_layers = (self.log_size - 2) * 2 + 1
 
         self.convs = nn.ModuleList()
         self.to_rgbs = nn.ModuleList()
@@ -408,13 +421,13 @@ class Generator(nn.Module):
     def make_noise(self):
         device = self.input.input.device
 
-        noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
+        noise = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
 
         for i in range(3, self.log_size + 1):
             for _ in range(2):
-                noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
+                noise.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
 
-        return noises
+        return noise
     
     def mean_latent(self, n_latent):
         latent_in = torch.randn(n_latent, self.style_dim, device=self.input.input.device)
@@ -461,12 +474,12 @@ class Generator(nn.Module):
         else:
             if inject_index is None:
                 inject_index = np.random.randint(1, self.n_latent - 1)
-
+            
             latent = styles[0].unsqueeze(1).repeat(1, inject_index, 1)
             latent2 = styles[1].unsqueeze(1).repeat(1, self.n_latent - inject_index, 1)
 
             latent = torch.cat([latent, latent2], 1)
-                
+        
         # mapping network
         out = self.input(latent)
         
@@ -496,21 +509,9 @@ class Generator(nn.Module):
         else:
             return image, None
 
-#Fused version of LeakyReLU
-class FusedLeakyReLU(nn.Module):
-    def __init__(self, channel, negative_slope=0.2, scale=2 ** 0.5):
-        super().__init__()
-
-        self.bias = nn.Parameter(torch.zeros(channel))
-        self.negative_slope = negative_slope
-        self.scale = scale
-
-    def forward(self, input):
-        return F.leaky_relu(input + self.bias, negative_slope=self.negative_slope) * self.scale
-
 # Custom conv2D class
 class EqualConv2d(nn.Module):
-    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True, activate=True):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
 
         self.weight = nn.Parameter(
@@ -563,7 +564,7 @@ class ConvLayer(nn.Sequential):
         
         if activate:
             if bias:
-                layers.append(FusedLeakyReLU((1, out_channel, 1, 1)))
+                layers.append(FusedLeakyReLU(out_channel))
 
             else:
                 layers.append(ScaledLeakyReLU(0.2))
@@ -592,7 +593,7 @@ class ResBlock(nn.Module):
         return out
 
 class Discriminator(nn.Module):
-    def __init__(self, size, channel_multiplier=2, blur_kernel=[1, 3, 3, 1]):
+    def __init__(self, sizex, sizey, channel_multiplier=2, blur_kernel=[1, 3, 3, 1]):
         super().__init__()
 
         channels = {
@@ -607,6 +608,7 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
+        size = max(sizex, sizey)
         convs = [ConvLayer(3, channels[size], 1)]
 
         log_size = int(math.log(size, 2))
@@ -619,6 +621,9 @@ class Discriminator(nn.Module):
             convs.append(ResBlock(in_channel, out_channel, blur_kernel))
 
             in_channel = out_channel
+        
+        endx = sizex // (2 ** (len(convs) - 1))
+        endy = sizey // (2 ** (len(convs) - 1))
 
         self.convs = nn.Sequential(*convs)
 
@@ -632,7 +637,7 @@ class Discriminator(nn.Module):
         
         # conv to Linear
         self.final_linear = nn.Sequential(
-            EqualLinear(channels[4] * 4 * 4, channels[4], activation=True),
+            EqualLinear(channels[4] * endx * endy, channels[4], activation=True),
             EqualLinear(channels[4], 1),
         )
 
